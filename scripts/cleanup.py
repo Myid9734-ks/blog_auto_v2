@@ -65,6 +65,10 @@ def main():
         except (json.JSONDecodeError, Exception) as e:
             print(f"⚠️  image_paths.json 읽기 실패: {e}")
 
+    # 고아 이미지 삭제 (image_paths.json이 매 실행마다 덮어써져서
+    # 이전 실행분이 기록에서 누락된 채 images/ 폴더에 남는 경우 정리)
+    delete_dir_contents(IMAGES_DIR, deleted, skipped)
+
     # output 파일 삭제
     delete_file(CONTENT_JSON, deleted, skipped)
     delete_file(IMAGE_PATHS_JSON, deleted, skipped)

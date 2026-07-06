@@ -150,16 +150,22 @@ def open_editor(page) -> None:
     if "nid.naver.com" in page.url or "nidlogin" in page.url:
         raise LoginError("글쓰기 페이지 이동 중 로그인 화면으로 리다이렉트됨")
 
-    # 이전 글 이어쓰기 팝업 처리
+    # 이전에 작성 중이던 글을 이어서 쓸지 묻는 팝업 처리.
+    # 자동화는 항상 output 파일 기준으로 새 글을 작성해야 하므로 '취소'를 눌러
+    # 옛 임시저장 글을 버리고 새로 시작한다. 팝업이 iframe 안/밖 어디에 뜨는지
+    # 확실치 않으므로 page와 editor frame 둘 다 확인한다.
     ef = get_editor_frame(page)
-    try:
-        popup = ef.locator("div.se-popup-alert-confirm")
-        if popup.is_visible(timeout=3000):
-            btn = popup.locator("button").filter(has_text="확인")
-            (btn.first if btn.count() > 0 else popup.locator("button").last).click()
-            page.wait_for_timeout(1000)
-    except Exception:
-        pass
+    for scope in (page, ef):
+        try:
+            popup = scope.locator("text=작성 중인 글이 있습니다")
+            if popup.count() > 0 and popup.first.is_visible(timeout=3000):
+                cancel_btn = scope.locator("button:has-text('취소')")
+                if cancel_btn.count() > 0 and cancel_btn.first.is_visible(timeout=1000):
+                    cancel_btn.first.click()
+                    page.wait_for_timeout(1000)
+                    break
+        except Exception:
+            continue
 
 
 def fill_title(page, ef, title: str) -> None:
@@ -293,18 +299,115 @@ def publish_open(page, ef) -> None:
     page.wait_for_timeout(2000)
 
 
+def debug_dump_publish_state(page, ef) -> None:
+    """발행 실패 원인 파악용: 스크린샷 + '발행' 버튼 후보들의 상태를 /tmp에 저장."""
+    try:
+        page.screenshot(path="/tmp/naver_publish_debug.png")
+    except Exception:
+        pass
+    try:
+        info = ef.evaluate(
+            """
+            () => [...document.querySelectorAll('button')]
+                .filter(b => (b.textContent || '').includes('발행'))
+                .map(b => {
+                    const r = b.getBoundingClientRect();
+                    return {
+                        text: (b.textContent || '').trim(),
+                        cls: b.className,
+                        disabled: b.disabled,
+                        visible: r.width > 0 && r.height > 0,
+                        rect: { x: r.x, y: r.y, w: r.width, h: r.height },
+                    };
+                })
+            """
+        )
+        Path("/tmp/naver_publish_debug.json").write_text(
+            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"  디버그 정보 저장: /tmp/naver_publish_debug.png, /tmp/naver_publish_debug.json")
+    except Exception as e:
+        print(f"  디버그 정보 저장 실패: {e}")
+
+
+def find_publish_confirm_button(ef):
+    """상단 '발행' 토글 버튼과 패널 안 최종 확인 버튼 모두 텍스트가 '발행'이고
+    CSS 클래스명은 해시가 붙어 로드마다 바뀌므로 신뢰할 수 없다.
+    대신 위치로 구분한다: 토글 버튼은 항상 상단(y가 작음), 확인 버튼은 항상
+    패널 맨 아래(y가 가장 큼)에 있으므로 화면에서 가장 아래에 있는 후보를 고른다."""
+    candidates = ef.locator("button:has-text('발행')")
+    count = candidates.count()
+    best = None
+    best_y = -1.0
+    for idx in range(count):
+        cand = candidates.nth(idx)
+        try:
+            if not cand.is_visible(timeout=500):
+                continue
+            box = cand.bounding_box()
+            if box and box["y"] > best_y:
+                best_y = box["y"]
+                best = cand
+        except Exception:
+            continue
+    return best
+
+
 def publish_confirm(page, ef) -> None:
-    # 패널 안의 최종 발행 버튼 = 'button:has-text("발행")' 중 마지막 것
-    btn = ef.locator("button:has-text('발행')").last
+    btn = find_publish_confirm_button(ef)
+    if btn is None:
+        raise UploadError("최종 발행 버튼을 찾을 수 없음 (후보 없음)")
+
+    network_log = []
+
+    def on_request(req):
+        if req.method == "POST":
+            network_log.append(
+                {"type": "request", "url": req.url, "postData": (req.post_data or "")[:500]}
+            )
+
+    def on_response(res):
+        if res.request.method == "POST":
+            try:
+                body = res.text()[:500]
+            except Exception:
+                body = "(읽기 실패)"
+            network_log.append(
+                {"type": "response", "url": res.url, "status": res.status, "body": body}
+            )
+
+    page.on("request", on_request)
+    page.on("response", on_response)
     try:
         btn.wait_for(state="visible", timeout=10000)
         btn.scroll_into_view_if_needed()
         page.wait_for_timeout(300)
-        btn.click(force=True)
-        page.wait_for_timeout(3000)
+        try:
+            btn.click(timeout=5000)
+        except PlaywrightTimeoutError:
+            btn.click(timeout=5000, force=True)
+
+        # 발행 성공 여부 검증: 실제 발행되면 postwrite 편집 페이지를 벗어나 포스트 URL로 이동한다.
+        # 클릭 자체는 성공해도 팝업이 남아있거나 잘못된 버튼을 눌렀으면 URL이 그대로이므로 이를 감지한다.
+        try:
+            page.wait_for_url(lambda url: "postwrite" not in url, timeout=8000)
+        except PlaywrightTimeoutError:
+            debug_dump_publish_state(page, ef)
+            Path("/tmp/naver_publish_network.json").write_text(
+                json.dumps(network_log, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print("  네트워크 로그 저장: /tmp/naver_publish_network.json")
+            raise UploadError(
+                f"발행 버튼 클릭 후에도 편집 페이지에 머물러 있음 (발행 실패 추정, 현재 URL: {page.url})"
+            )
         print("  최종 발행 완료")
+    except UploadError:
+        raise
     except Exception as e:
         raise UploadError(f"최종 발행 버튼을 찾을 수 없음: {e}")
+    finally:
+        page.remove_listener("request", on_request)
+        page.remove_listener("response", on_response)
 
 
 def upload(context, page, data: dict) -> None:
@@ -360,6 +463,9 @@ def run_with_retry(data: dict) -> bool:
                     ignore_default_args=["--enable-automation"],
                 )
                 page = context.pages[0] if context.pages else context.new_page()
+                # 발행 확인 등 네이티브 dialog는 기본적으로 Playwright가 자동 취소하므로,
+                # 반드시 수락하도록 핸들러를 등록해야 발행이 실제로 진행된다.
+                page.on("dialog", lambda dialog: dialog.accept())
                 upload(context, page, data)
                 context.close()
             send_telegram(f"✅ 네이버 블로그 업로드 완료\n제목: {data['title']}")

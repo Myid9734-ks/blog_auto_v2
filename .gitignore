@@ -1,0 +1,22 @@
+# secrets
+.env
+
+# login sessions / cookies
+config/naver_profile/
+config/tistory_profile/
+config/tistory_cookies.json
+
+# generated artifacts (regenerated per run)
+output/content.json
+output/image_paths.json
+output/naver/
+output/tistory/
+images/*.png
+logs/used_titles.json
+
+# python
+__pycache__/
+*.pyc
+
+# os
+.DS_Store

@@ -369,16 +369,49 @@ def fill_tags(page, hashtags: str) -> None:
             page.wait_for_timeout(300)
 
 
-def publish(page) -> None:
+def verify_recent_post(page, title: str) -> bool:
+    """발행 버튼 클릭이 페이지 이동을 유발해 컨텍스트가 파괴되며 예외가 나는 경우
+    실제로는 발행이 이미 서버에 반영됐을 수 있다. 이를 실패로 단정하면 다음
+    재시도에서 새 글쓰기 페이지를 열어 이미 올라간 글을 중복 발행하게 되므로,
+    글 목록에서 실제로 올라갔는지 재확인한다."""
+    try:
+        page.goto(f"{TISTORY_BLOG_URL}/manage/posts", wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
+        return page.locator(f"text={title}").count() > 0
+    except Exception:
+        return False
+
+
+def publish(page, title: str) -> None:
+    url_before = page.url
     page.locator("button#publish-layer-btn").click()
     page.wait_for_timeout(1000)
-    page.locator("button#publish-btn").click()
-    # 발행 AJAX 완료 보장: 네트워크 idle 대기
     try:
-        page.wait_for_load_state("networkidle", timeout=12000)
+        page.locator("button#publish-btn").click(timeout=5000)
+    except Exception as e:
+        # 클릭 자체가 페이지 이동을 유발해 실행 컨텍스트가 파괴되며 예외가 나는
+        # 경우가 있다. 클릭은 이미 서버에 도달했을 수 있으므로 여기서 바로
+        # 실패 처리하지 않고 아래 검증 단계로 넘어간다.
+        print(f"  발행 버튼 클릭 중 예외(페이지 이동 가능성): {e}")
+
+    try:
+        page.wait_for_url(lambda url: url != url_before, timeout=12000)
+        print("  최종 발행 완료 (URL 변경 확인)")
+        return
+    except Exception:
+        pass
+
+    # URL 변화가 없어도 AJAX만으로 발행이 끝나는 경우가 있으므로 네트워크 idle을 기다린다.
+    try:
+        page.wait_for_load_state("networkidle", timeout=8000)
     except Exception:
         page.wait_for_timeout(5000)
-    page.wait_for_timeout(1000)
+
+    if verify_recent_post(page, title):
+        print("  글 목록에서 발행 확인 → 발행 성공 처리")
+        return
+
+    raise UploadError("발행 버튼 클릭 후에도 발행이 확인되지 않음 (발행 실패 추정)")
 
 
 def upload(page, data: dict, cookies: list) -> None:
@@ -415,7 +448,7 @@ def upload(page, data: dict, cookies: list) -> None:
         }
     """)
     print(f"  [8] 발행 (본문 {char_check})")
-    publish(page)
+    publish(page, data["title"])
     print("  ✅ 업로드 완료")
 
 

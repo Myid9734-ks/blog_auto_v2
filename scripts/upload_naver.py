@@ -144,28 +144,41 @@ def verify_login(page) -> bool:
     return "nid.naver.com" not in page.url
 
 
+def dismiss_draft_popup(page, timeout_ms: int = 8000) -> None:
+    """이전에 작성 중이던 글을 이어서 쓸지 묻는 팝업 처리.
+    자동화는 항상 output 파일 기준으로 새 글을 작성해야 하므로 '취소'를 눌러
+    옛 임시저장 글을 버리고 새로 시작한다. 팝업이 언제/어느 frame에 뜰지 알 수
+    없으므로(비동기 렌더링), locator.is_visible(timeout=...)의 timeout은 무시되고
+    즉시 스냅샷만 반환한다는 점에 유의해 wait_for로 매번 새로 프레임 목록을 훑으며
+    폴링한다. 한 번만 확인하면 팝업이 늦게 뜨는 경우 놓친다."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        for scope in (page, *page.frames):
+            try:
+                popup = scope.locator("text=작성 중인 글이 있습니다")
+                if popup.count() == 0:
+                    continue
+                popup.first.wait_for(state="visible", timeout=1000)
+            except Exception:
+                continue
+            try:
+                cancel_btn = scope.locator("button:has-text('취소')")
+                cancel_btn.first.wait_for(state="visible", timeout=1000)
+                cancel_btn.first.click()
+                page.wait_for_timeout(1000)
+                return
+            except Exception:
+                continue
+        page.wait_for_timeout(300)
+
+
 def open_editor(page) -> None:
     page.goto(NAVER_WRITE_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(5000)
+    page.wait_for_timeout(3000)
     if "nid.naver.com" in page.url or "nidlogin" in page.url:
         raise LoginError("글쓰기 페이지 이동 중 로그인 화면으로 리다이렉트됨")
 
-    # 이전에 작성 중이던 글을 이어서 쓸지 묻는 팝업 처리.
-    # 자동화는 항상 output 파일 기준으로 새 글을 작성해야 하므로 '취소'를 눌러
-    # 옛 임시저장 글을 버리고 새로 시작한다. 팝업이 iframe 안/밖 어디에 뜨는지
-    # 확실치 않으므로 page와 editor frame 둘 다 확인한다.
-    ef = get_editor_frame(page)
-    for scope in (page, ef):
-        try:
-            popup = scope.locator("text=작성 중인 글이 있습니다")
-            if popup.count() > 0 and popup.first.is_visible(timeout=3000):
-                cancel_btn = scope.locator("button:has-text('취소')")
-                if cancel_btn.count() > 0 and cancel_btn.first.is_visible(timeout=1000):
-                    cancel_btn.first.click()
-                    page.wait_for_timeout(1000)
-                    break
-        except Exception:
-            continue
+    dismiss_draft_popup(page)
 
 
 def fill_title(page, ef, title: str) -> None:
@@ -353,7 +366,21 @@ def find_publish_confirm_button(ef):
     return best
 
 
-def publish_confirm(page, ef) -> None:
+def verify_recent_post(page, blog_id: str, title: str) -> bool:
+    """URL 변화만으로는 발행 성공을 신뢰할 수 없을 때(네이버 에디터 URL 포맷이
+    실행마다 달라 postwrite 문자열 유무로 판단이 불가능한 경우가 있음) 블로그
+    메인에서 방금 쓴 글이 실제로 올라갔는지 재확인한다. 이 확인 없이 실패로
+    단정하면 이미 발행된 글을 다음 재시도에서 중복 발행하게 된다."""
+    try:
+        page.goto(f"https://blog.naver.com/{blog_id}", wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+        frame = page.frame(name="mainFrame") or page
+        return frame.locator(f"text={title}").count() > 0
+    except Exception:
+        return False
+
+
+def publish_confirm(page, ef, title: str) -> None:
     btn = find_publish_confirm_button(ef)
     if btn is None:
         raise UploadError("최종 발행 버튼을 찾을 수 없음 (후보 없음)")
@@ -382,16 +409,22 @@ def publish_confirm(page, ef) -> None:
         btn.wait_for(state="visible", timeout=10000)
         btn.scroll_into_view_if_needed()
         page.wait_for_timeout(300)
+        url_before = page.url
         try:
             btn.click(timeout=5000)
         except PlaywrightTimeoutError:
             btn.click(timeout=5000, force=True)
 
-        # 발행 성공 여부 검증: 실제 발행되면 postwrite 편집 페이지를 벗어나 포스트 URL로 이동한다.
-        # 클릭 자체는 성공해도 팝업이 남아있거나 잘못된 버튼을 눌렀으면 URL이 그대로이므로 이를 감지한다.
+        # 발행 성공 여부 검증: 실제 발행되면 에디터 URL을 벗어나 포스트 URL로 이동한다.
+        # "postwrite" 문자열 유무로 판단하면 네이버 에디터 URL 포맷이 실행마다 달라 오탐이
+        # 생기므로, 클릭 직전 URL과 달라졌는지만 확인한다.
         try:
-            page.wait_for_url(lambda url: "postwrite" not in url, timeout=8000)
+            page.wait_for_url(lambda url: url != url_before, timeout=15000)
+            print("  최종 발행 완료")
         except PlaywrightTimeoutError:
+            if verify_recent_post(page, NAVER_BLOG_ID, title):
+                print("  URL 변화는 감지되지 않았지만 블로그에 글이 실제로 올라간 것을 확인 → 발행 성공 처리")
+                return
             debug_dump_publish_state(page, ef)
             Path("/tmp/naver_publish_network.json").write_text(
                 json.dumps(network_log, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -400,7 +433,6 @@ def publish_confirm(page, ef) -> None:
             raise UploadError(
                 f"발행 버튼 클릭 후에도 편집 페이지에 머물러 있음 (발행 실패 추정, 현재 URL: {page.url})"
             )
-        print("  최종 발행 완료")
     except UploadError:
         raise
     except Exception as e:
@@ -444,7 +476,7 @@ def upload(context, page, data: dict) -> None:
     fill_tags(page, ef, data["hashtags"])
 
     print("  [8] 최종 발행")
-    publish_confirm(page, ef)
+    publish_confirm(page, ef, data["title"])
     print("  ✅ 업로드 완료")
 
 

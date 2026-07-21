@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from shared.constants import TISTORY_COOKIES, TISTORY_PROFILE
@@ -83,7 +84,14 @@ def main():
 
         input("\n로그인 완료 후 Enter를 누르세요... ")
 
-        if not verify_login(page, manage_url):
+        try:
+            logged_in = verify_login(page, manage_url)
+        except PlaywrightError:
+            print("❌ 브라우저 창이 이미 닫혀 있습니다.")
+            print("   로그인 후 창을 닫지 말고 그대로 둔 채 터미널에서 Enter를 누르세요.")
+            sys.exit(1)
+
+        if not logged_in:
             context.close()
             print("❌ 로그인 확인 실패 — 다시 시도하세요.")
             sys.exit(1)

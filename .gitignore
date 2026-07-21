@@ -7,10 +7,8 @@ config/tistory_profile/
 config/tistory_cookies.json
 
 # generated artifacts (regenerated per run)
-output/content.json
-output/image_paths.json
-output/naver/
-output/tistory/
+output/
+run_archive/
 images/*.png
 logs/used_titles.json
 

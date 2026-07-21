@@ -28,6 +28,7 @@ from shared.constants import (
     NAVER_PROFILE,
     UPLOAD_MAX_RETRIES,
 )
+from shared.used_titles import record_title
 from shared.utils import ensure_dirs
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -500,6 +501,7 @@ def run_with_retry(data: dict) -> bool:
                 page.on("dialog", lambda dialog: dialog.accept())
                 upload(context, page, data)
                 context.close()
+            record_title(data["title"])
             send_telegram(f"✅ 네이버 블로그 업로드 완료\n제목: {data['title']}")
             return True
 

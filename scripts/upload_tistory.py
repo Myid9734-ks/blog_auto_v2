@@ -9,6 +9,7 @@ setup_tistory.py로 최초 로그인 후 실행해야 한다.
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ from shared.constants import (
     TISTORY_DIR,
     UPLOAD_MAX_RETRIES,
 )
+from shared.used_titles import record_title
 from shared.utils import ensure_dirs
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -96,11 +98,111 @@ def verify_login(page) -> bool:
     )
 
 
+def find_kakao_account_button(page):
+    """카카오 '로그인할 계정 선택' 화면에서 기억된 계정 항목을 찾는다. 클래스명은
+    신뢰할 수 없으므로 이메일 형태(@ 포함) 텍스트를 가진 항목 중 '새로운 계정으로
+    로그인'이 아닌 첫 번째 항목을 사용한다. 저장된 계정이 아예 없으면(완전
+    로그아웃) 매치되는 항목이 없어 None을 반환한다."""
+    try:
+        candidates = page.get_by_text(re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"))
+        for i in range(candidates.count()):
+            el = candidates.nth(i)
+            text = el.inner_text(timeout=500).strip()
+            if "새로운 계정" not in text:
+                return el
+    except Exception:
+        pass
+    return None
+
+
+def debug_dump_login_state(page, tag: str) -> None:
+    """자동 재로그인이 어느 단계에서 막혔는지 다음 실행 때 눈으로 확인할 수
+    있도록 스크린샷과 URL을 남긴다."""
+    try:
+        page.screenshot(path=f"/tmp/tistory_login_{tag}.png")
+        print(f"  [로그인 디버그:{tag}] url={page.url} → /tmp/tistory_login_{tag}.png")
+    except Exception as e:
+        print(f"  [로그인 디버그:{tag}] 스크린샷 저장 실패: {e}")
+
+
+def attempt_kakao_relogin(page) -> bool:
+    """티스토리 세션은 매일 만료되지만 카카오 쪽 '기기 기억'은 더 오래 남아있어,
+    로그인 화면이 떠도 실제로는 계정 선택 한 번 클릭이면 재인증이 끝나는 경우가
+    많다. 이를 매번 사람이 처리해야 할 실패로 취급하면 하루마다 setup_tistory.py를
+    수동 실행해야 하므로, 계정 선택 화면이면 자동으로 클릭해 복구를 시도한다.
+    비밀번호 입력이 필요한 완전 로그아웃 상태면 복구를 포기하고 False를 반환한다.
+
+    화면은 두 단계다: 먼저 티스토리 자체 로그인 페이지(auth/login)에서
+    '카카오계정으로 로그인' 버튼을 눌러야 accounts.kakao.com의 계정 선택
+    화면으로 넘어간다."""
+    if "accounts.kakao.com" not in page.url.lower():
+        print(f"  [1단계] 티스토리 로그인 페이지에서 카카오 버튼 탐색 (현재 url={page.url})")
+        try:
+            kakao_btn = page.get_by_text("카카오계정으로 로그인").first
+            if kakao_btn.count() == 0:
+                print("  [1단계] '카카오계정으로 로그인' 버튼을 찾지 못함")
+                debug_dump_login_state(page, "1-no-button")
+                return False
+            kakao_btn.scroll_into_view_if_needed()
+            kakao_btn.click(timeout=5000)
+            print("  [1단계] 카카오 버튼 클릭 완료, 이동 대기")
+            page.wait_for_timeout(2500)
+        except Exception as e:
+            print(f"  [1단계] 클릭 실패: {e}")
+            debug_dump_login_state(page, "1-click-failed")
+            return False
+
+    if "accounts.kakao.com" not in page.url.lower():
+        print(f"  [2단계] 카카오 페이지로 이동하지 못함 (현재 url={page.url})")
+        debug_dump_login_state(page, "2-not-on-kakao")
+        return False
+
+    print(f"  [2단계] 카카오 계정 선택 화면 도착 (url={page.url}), 기억된 계정 탐색")
+    page.wait_for_timeout(1000)
+    account = find_kakao_account_button(page)
+    if account is None:
+        print("  [2단계] 기억된 계정 항목을 찾지 못함 (완전 로그아웃 상태로 추정)")
+        debug_dump_login_state(page, "2-no-account")
+        return False
+    try:
+        account.scroll_into_view_if_needed()
+        account.click(timeout=5000)
+        print("  [2단계] 계정 클릭 완료, 이동 대기")
+        page.wait_for_timeout(3000)
+        return True
+    except Exception as e:
+        print(f"  [2단계] 계정 클릭 실패: {e}")
+        debug_dump_login_state(page, "2-click-failed")
+        return False
+
+
+def ensure_logged_in(page) -> None:
+    if verify_login(page):
+        return
+    print("  세션 만료 감지 → 카카오 자동 재로그인 시도")
+    if attempt_kakao_relogin(page) and verify_login(page):
+        print("  카카오 자동 재로그인 성공")
+        return
+    raise LoginError(
+        "로그인 세션 만료 + 카카오 자동 재로그인 실패 (기기 기억도 만료된 것으로 추정) "
+        "— setup_tistory.py를 다시 실행하세요"
+    )
+
+
 def open_editor(page) -> None:
     page.goto(f"{TISTORY_BLOG_URL}/manage/newpost", wait_until="domcontentloaded")
     page.wait_for_timeout(5000)
     if "accounts.kakao.com" in page.url.lower():
-        raise LoginError("글쓰기 페이지 이동 중 로그인 화면으로 리다이렉트됨")
+        if not attempt_kakao_relogin(page):
+            raise LoginError(
+                "글쓰기 페이지 이동 중 로그인 화면으로 리다이렉트됨 — setup_tistory.py를 다시 실행하세요"
+            )
+        page.goto(f"{TISTORY_BLOG_URL}/manage/newpost", wait_until="domcontentloaded")
+        page.wait_for_timeout(5000)
+        if "accounts.kakao.com" in page.url.lower():
+            raise LoginError(
+                "카카오 자동 재로그인 후에도 로그인 화면에 머물러 있음 — setup_tistory.py를 다시 실행하세요"
+            )
 
 
 def find_upload_url(page) -> str:
@@ -178,8 +280,9 @@ def upload_image_via_attach_btn(page, image_path: str) -> str:
 
     page.on("response", on_response)
     try:
-        # 첨부 버튼 클릭 (id="attach-layer-btn")
-        page.locator("#attach-layer-btn").click(timeout=5000)
+        # 첨부 버튼 클릭 (id="attach-layer-btn"). HTML/마크다운 에디터 컨테이너
+        # 둘 다 이 id를 갖고 있어 항상 2개가 매치되므로 화면에 보이는 것만 고른다.
+        page.locator("#attach-layer-btn:visible").first.click(timeout=5000)
         print("  #attach-layer-btn 클릭")
         page.wait_for_timeout(1500)
 
@@ -212,7 +315,7 @@ def upload_image_via_attach_btn(page, image_path: str) -> str:
         else:
             # file chooser 방식 시도
             with page.expect_file_chooser(timeout=4000) as fc_info:
-                page.locator("#attach-layer-btn").click()
+                page.locator("#attach-layer-btn:visible").first.click()
             fc_info.value.set_files(image_path)
             page.wait_for_timeout(5000)
 
@@ -255,9 +358,13 @@ def upload_image_via_attach_btn(page, image_path: str) -> str:
     raise UploadError(f"CDN URL 획득 실패: {image_path}")
 
 
-def upload_images(page, image_paths: list, cookies: list) -> list:
+def upload_images(page, image_paths: list) -> list:
     """이미지 목록을 업로드하고 CDN URL 목록을 반환한다."""
     upload_url = find_upload_url(page)
+    # requests 방식은 브라우저와 별개의 세션이므로, 실행 시점의 브라우저 쿠키를
+    # 그대로 써야 한다. 디스크에서 읽은 쿠키는 카카오 자동 재로그인으로 세션이
+    # 갱신된 뒤에도 예전 값 그대로라 이 요청만 로그인 안 된 것으로 처리된다.
+    live_cookies = page.context.cookies()
     cdn_urls = []
 
     for i, path in enumerate(image_paths):
@@ -265,7 +372,7 @@ def upload_images(page, image_paths: list, cookies: list) -> list:
 
         if upload_url:
             try:
-                url = upload_image_via_requests(path, upload_url, cookies)
+                url = upload_image_via_requests(path, upload_url, live_cookies)
                 print(f"    CDN: {url}")
                 cdn_urls.append(url)
                 continue
@@ -414,17 +521,16 @@ def publish(page, title: str) -> None:
     raise UploadError("발행 버튼 클릭 후에도 발행이 확인되지 않음 (발행 실패 추정)")
 
 
-def upload(page, data: dict, cookies: list) -> None:
+def upload(page, data: dict) -> None:
     print("  [1] 로그인 상태 확인")
-    if not verify_login(page):
-        raise LoginError("로그인 세션 없음 — setup_tistory.py를 다시 실행하세요")
+    ensure_logged_in(page)
 
     print("  [2] 글쓰기 페이지 열기")
     open_editor(page)
 
     print("  [3] 이미지 CDN 업로드")
     image_paths = load_image_paths()
-    cdn_urls = upload_images(page, image_paths, cookies)
+    cdn_urls = upload_images(page, image_paths)
     content = replace_image_placeholders(data["content"], cdn_urls, image_paths)
 
     print(f"  [4] 제목 입력: {data['title']}")
@@ -468,8 +574,14 @@ def run_with_retry(data: dict) -> bool:
                 )
                 context.add_cookies(cookies)
                 page = context.new_page()
-                upload(page, data, cookies)
+                upload(page, data)
+                # 카카오 자동 재로그인으로 세션이 갱신됐을 수 있으므로 다음 실행이
+                # 최신 쿠키를 쓰도록 덮어써 만료 주기를 실질적으로 늦춘다.
+                TISTORY_COOKIES.write_text(
+                    json.dumps(context.cookies(), ensure_ascii=False, indent=2), encoding="utf-8"
+                )
                 context.close()
+            record_title(data["title"])
             send_telegram(f"✅ 티스토리 업로드 완료\n제목: {data['title']}")
             return True
 
